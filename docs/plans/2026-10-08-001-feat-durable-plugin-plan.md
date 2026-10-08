@@ -1,5 +1,13 @@
 # Plan: a0-plugin-durable — durable agent execution (Khan#194)
 
+> **Status: HISTORICAL** — this is the intake plan. Post-review divergence:
+> signals are durable-promise-based (Restate shared handlers can't `ctx.set`),
+> paused tasks don't auto-attach (resume signal spawns the runner),
+> `incomplete_tasks` excludes `paused`, checkpoint replay uses a
+> `checkpointed_through` boundary, and `resume_incomplete` replaced the
+> original `attach`-in-interface design (see `helpers/engines/base.py` for
+> the shipped contract). AGENTS.md documents current behavior.
+
 ## Source / intent
 
 Khan issue [#194](https://github.com/duketopceo/Khan/issues/194) — extract

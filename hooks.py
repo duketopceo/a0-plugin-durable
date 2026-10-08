@@ -5,6 +5,8 @@ calls hooks before the runtime config layer is guaranteed ready, so the
 sync `startup_migration` extension owns configure(). uninstall() stops all
 plugin-owned services (restate ASGI endpoint thread, live local runners);
 journaled state survives on disk — tasks resume on next install+tick.
+Both bodies are guarded — a hook raise would abort the host's
+install/uninstall path.
 """
 
 from __future__ import annotations
@@ -13,9 +15,12 @@ import logging
 
 
 def install() -> None:
-    logging.getLogger("a0.durable").info(
-        "durable plugin installed — engine configures at startup_migration"
-    )
+    try:
+        logging.getLogger("a0.durable").info(
+            "durable plugin installed — engine configures at startup_migration"
+        )
+    except Exception:
+        pass
 
 
 def uninstall() -> None:

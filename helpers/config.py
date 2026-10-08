@@ -19,6 +19,7 @@ DEFAULTS: dict[str, Any] = {
     "journal_path": "",
     "step_timeout_s": 300,
     "max_iterations": 100,
+    "max_concurrent": 8,
     "tasks": [],
     "restate_ingress": "http://127.0.0.1:8080",
     "restate_admin": "http://127.0.0.1:9070",
@@ -34,6 +35,7 @@ _ENV_MAP = {
     "DURABLE_RESTATE_INGRESS": "restate_ingress",
     "DURABLE_RESTATE_ADMIN": "restate_admin",
     "DURABLE_LISTEN_PORT": "listen_port",
+    "DURABLE_MAX_CONCURRENT": "max_concurrent",
 }
 
 

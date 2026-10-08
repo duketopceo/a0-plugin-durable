@@ -55,7 +55,22 @@ CREATE TABLE IF NOT EXISTS steps (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (task_id, step_key)
 );
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_steps_status ON steps(status);
 """
+
+# Statuses a runner may pick up. 'paused' is deliberately absent — a paused
+# task stays parked until an explicit resume signal attaches a runner.
+_RESUMABLE_VALUES = tuple(
+    s.value
+    for s in (
+        TaskStatus.CREATED,
+        TaskStatus.PLANNED,
+        TaskStatus.EXECUTING,
+        TaskStatus.CHECKPOINTED,
+        TaskStatus.RESUMED,
+    )
+)
 
 
 class Journal:
@@ -71,7 +86,9 @@ class Journal:
             self._path, check_same_thread=False, timeout=30
         )
         self._con.execute("PRAGMA journal_mode=WAL")  # persistent db setting
-        self._con.execute("PRAGMA synchronous=NORMAL")
+        # FULL so a power loss can't drop the last committed step_done — the
+        # 'journaled before trusted' contract depends on the write surviving.
+        self._con.execute("PRAGMA synchronous=FULL")
         with self._lock, self._con:
             self._con.executescript(_SCHEMA)
             # A crash can strand 'running' steps — reset them to failed so a
@@ -120,10 +137,14 @@ class Journal:
                 ).fetchone()
             if row is None:
                 return None
+            input_parsed = json_or(row[1], {})
+            state_parsed = json_or(row[2], None)
             return {
                 "status": row[0],
-                "input": json_or(row[1], {}),
-                "state": json_or(row[2], {}),
+                "input": input_parsed if isinstance(input_parsed, dict) else {},
+                # corrupt/non-dict state_json surfaces as None — the engine
+                # fails the task closed instead of running on fabricated state
+                "state": state_parsed if isinstance(state_parsed, dict) else None,
             }
         except Exception as e:
             log.warning("journal get_task(%s) failed: %s", task_id, e)
@@ -148,29 +169,68 @@ class Journal:
         *,
         status: TaskStatus | None = None,
         state: TaskState | None = None,
-    ) -> None:
+        non_terminal_only: bool = False,
+    ) -> bool:
+        """Returns True when the write committed. ``non_terminal_only`` makes
+        the status write a compare-and-swap — a signal/terminal write that
+        already landed wins over a stale runner write (and vice versa)."""
+        try:
+            # Serialize BEFORE the transaction: a to_json() failure must not
+            # roll back a status write that already committed in the same txn.
+            state_json = state.to_json() if state is not None else None
+        except Exception as e:
+            log.warning("journal update_task(%s): state not serializable: %s", task_id, e)
+            return False
         try:
             with self._lock, self._con:
                 if status is not None:
+                    guard = (
+                        " AND status NOT IN ('completed','failed')"
+                        if non_terminal_only
+                        else ""
+                    )
                     self._con.execute(
-                        "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+                        f"UPDATE tasks SET status=?, updated_at=? WHERE id=?{guard}",
                         (status.value, time.time(), task_id),
                     )
-                if state is not None:
+                if state_json is not None:
                     self._con.execute(
                         "UPDATE tasks SET state_json=?, updated_at=? WHERE id=?",
-                        (state.to_json(), time.time(), task_id),
+                        (state_json, time.time(), task_id),
                     )
+            return True
         except Exception as e:
             log.warning("journal update_task(%s) failed: %s", task_id, e)
+            return False
+
+    def get_meta(self, task_id: str) -> dict[str, Any] | None:
+        """Bounded status projection — hot poll path; never parses
+        state_json (which grows with task history)."""
+
+        try:
+            with self._lock:
+                row = self._con.execute(
+                    "SELECT status, created_at, updated_at FROM tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            return {"id": task_id, "status": row[0], "created_at": row[1],
+                    "updated_at": row[2]}
+        except Exception as e:
+            log.warning("journal get_meta(%s) failed: %s", task_id, e)
+            return None
 
     def incomplete_tasks(self) -> list[str]:
-        """Task ids the runner should resume after a restart."""
+        """Resumable task ids — non-terminal AND not paused. A paused task
+        stays parked until an explicit resume signal attaches a runner, so
+        ticks don't accumulate one parked asyncio.Task per paused row."""
         try:
             with self._lock:
                 rows = self._con.execute(
-                    "SELECT id FROM tasks WHERE status NOT IN (?,?)",
-                    tuple(TERMINAL_VALUES),
+                    f"SELECT id FROM tasks WHERE status IN "
+                    f"({','.join('?' * len(_RESUMABLE_VALUES))})",
+                    _RESUMABLE_VALUES,
                 ).fetchall()
             return [r[0] for r in rows]
         except Exception as e:
@@ -194,7 +254,7 @@ class Journal:
             log.warning("journal step_result(%s,%s) failed: %s", task_id, step_key, e)
             return None
 
-    def step_begin(self, task_id: str, step_key: str, name: str) -> None:
+    def step_begin(self, task_id: str, step_key: str, name: str) -> bool:
         try:
             with self._lock, self._con:
                 self._con.execute(
@@ -202,24 +262,35 @@ class Journal:
                     "updated_at) VALUES (?,?,?,?,?)",
                     (task_id, step_key, name, "running", time.time()),
                 )
+            return True
         except Exception as e:
             log.warning("journal step_begin(%s,%s) failed: %s", task_id, step_key, e)
+            return False
 
     def step_done(
         self, task_id: str, step_key: str, name: str, result: dict[str, Any]
-    ) -> None:
+    ) -> bool:
+        """Serialize outside the transaction — a result that can't JSON must
+        fail the step, not leave a torn 'running' row that re-executes."""
+        try:
+            payload = json.dumps(result)
+        except Exception:
+            self.step_failed(task_id, step_key, name, "step result not JSON-serializable")
+            return False
         try:
             with self._lock, self._con:
                 # upsert — survives a lost step_begin write
                 self._con.execute(
                     "INSERT OR REPLACE INTO steps(task_id,step_key,name,status,"
                     "result_json,error,updated_at) VALUES (?,?,?,?,?,NULL,?)",
-                    (task_id, step_key, name, "done", json.dumps(result), time.time()),
+                    (task_id, step_key, name, "done", payload, time.time()),
                 )
+            return True
         except Exception as e:
             log.warning("journal step_done(%s,%s) failed: %s", task_id, step_key, e)
+            return False
 
-    def step_failed(self, task_id: str, step_key: str, name: str, error: str) -> None:
+    def step_failed(self, task_id: str, step_key: str, name: str, error: str) -> bool:
         try:
             with self._lock, self._con:
                 # upsert like step_done — a swallowed begin must not lose the failure
@@ -228,5 +299,7 @@ class Journal:
                     "error,updated_at) VALUES (?,?,?,?,?,?)",
                     (task_id, step_key, name, "failed", str(error)[:2000], time.time()),
                 )
+            return True
         except Exception as e:
             log.warning("journal step_failed(%s,%s) failed: %s", task_id, step_key, e)
+            return False

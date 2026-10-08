@@ -7,5 +7,6 @@ description: >
   the Khan fork's Temporal-shaped helpers/durable/.
 version: 0.1.0
 settings_sections:
-  - id: external
-    title: External services
+  - external
+per_project_config: false
+per_agent_config: false

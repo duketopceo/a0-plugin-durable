@@ -1,13 +1,16 @@
 """Runtime facade — engine selection + the never-raise public surface.
 
-configure() builds the engine synchronously; the Restate engine's serving
-side starts lazily on first async touch (submit/tick) because a0's
-startup_migration extensions run SYNC — there is no event loop at plugin
-init. Local engine needs no start step.
+configure() builds the engine synchronously; the engine's serving side
+starts lazily on first async touch via the uniform ``start()`` contract
+(startup_migration is SYNC — there is no event loop at plugin init).
+configure() refuses to replace a live engine: silent replacement would
+orphan runners double-executing on the same journal — call shutdown()
+first to reconfigure.
 
 Public surface: submit/status/signal/tick/shutdown. Every entry point is
 failure-contained — a durable-exec misconfiguration or a dead Restate
-server must never take a0 down.
+server must never take a0 down. ``is_active()`` means 'engine armed', not
+necessarily 'serving' (a restate endpoint comes up lazily).
 """
 
 from __future__ import annotations
@@ -29,7 +32,10 @@ _engine: Any | None = None
 _engine_kind = ""
 _engine_started = False
 _cfg: dict[str, Any] = {}
+_cfg_dynamic = False  # True when _cfg came from get_config() (host settings)
 _lock = threading.Lock()
+# Held refs to in-flight teardown tasks — fire-and-forget tasks are GC-unsafe.
+_pending_stops: set[asyncio.Task] = set()
 
 
 def _plugin_root() -> Path:
@@ -42,13 +48,31 @@ def _default_journal_path() -> str:
 
 def configure(cfg: dict[str, Any] | None = None) -> bool:
     """Select + construct the engine. Returns True when an engine is armed.
-    Never raises — returns False on any failure and the plugin goes inert."""
-    global _engine, _engine_kind, _engine_started, _cfg
+    Never raises — returns False on any failure and the plugin goes inert.
+    Refuses to replace a live engine (orphaned runners would double-execute
+    against the shared journal): shutdown() before reconfiguring."""
+    global _engine, _engine_kind, _engine_started, _cfg, _cfg_dynamic
     with _lock:
-        _engine = None
+        if _engine is not None:
+            log.warning(
+                "durable: configure() called while engine %r is live — "
+                "keeping existing config (shutdown() first to reconfigure)",
+                _engine_kind,
+            )
+            return True
         _engine_kind = ""
         _engine_started = False
-        _cfg = cfg or _cfg_mod.get_config()
+        try:
+            if isinstance(cfg, dict):
+                _cfg = cfg
+                _cfg_dynamic = False  # programmatic config — not re-read live
+            else:
+                _cfg = _cfg_mod.get_config()
+                _cfg_dynamic = True   # host config — tick() re-reads it so a
+                                      # mid-process `enabled: false` shuts down
+        except Exception:
+            _cfg = dict(_cfg_mod.DEFAULTS)
+            _cfg_dynamic = True
         if not _cfg_mod.truthy(_cfg.get("enabled")):
             return False
         try:
@@ -58,15 +82,24 @@ def configure(cfg: dict[str, Any] | None = None) -> bool:
                 from usr.plugins.durable.helpers.journal import Journal
                 from usr.plugins.durable.helpers.engines.local import LocalEngine
 
-                path = os.path.expanduser(str(_cfg.get("journal_path") or _default_journal_path()))
-                journal = Journal(path)
+                path = os.path.expanduser(
+                    str(_cfg.get("journal_path") or _default_journal_path())
+                )
+                resolved = Path(path).resolve()
+                if not str(resolved).startswith(str(_plugin_root().resolve())):
+                    log.warning(
+                        "durable: journal_path %s resolves outside the plugin "
+                        "dir — WAL needs a local filesystem and exactly one "
+                        "writer process", resolved,
+                    )
+                journal = Journal(resolved)
                 _engine = LocalEngine(
                     journal,
                     step_timeout_s=_cfg_mod.num(_cfg.get("step_timeout_s"), 300),
                     max_iterations=int(_cfg_mod.num(_cfg.get("max_iterations"), 100)),
+                    max_concurrent=int(_cfg_mod.num(_cfg.get("max_concurrent"), 8)),
                 )
                 _engine_kind = "local"
-                _engine_started = True
                 return True
             if kind == "restate":
                 from usr.plugins.durable.helpers.engines.restate import RestateEngine
@@ -75,9 +108,10 @@ def configure(cfg: dict[str, Any] | None = None) -> bool:
                     ingress=str(_cfg.get("restate_ingress", "")),
                     admin=str(_cfg.get("restate_admin", "")),
                     listen_port=int(_cfg_mod.num(_cfg.get("listen_port"), 9080)),
+                    # step_timeout_s is a local-engine knob — Restate owns
+                    # step timeouts/retries via its own retry policy
                     defaults={
                         "max_iterations": int(_cfg_mod.num(_cfg.get("max_iterations"), 100)),
-                        "step_timeout_s": _cfg_mod.num(_cfg.get("step_timeout_s"), 300),
                     },
                 )
                 if not engine.available:
@@ -102,18 +136,15 @@ _start_task: asyncio.Task | None = None
 
 
 async def _ensure_started() -> bool:
-    """Start the engine's serving side on first async use (restate only;
-    local is already started). Concurrent callers share one start task —
-    two starts would double-bind the ASGI port. Never raises."""
+    """Drive the engine's uniform async start() once — concurrent callers
+    share one start task so e.g. the restate ASGI port can't double-bind.
+    Engines needing no start just return True. Never raises."""
     global _engine_started, _start_task
     if _engine is None:
         return False
     if _engine_started:
         return True
     try:
-        if _engine_kind != "restate":
-            _engine_started = True
-            return True
         if _start_task is None or _start_task.done():
             _start_task = asyncio.get_running_loop().create_task(_engine.start())
         _engine_started = bool(await _start_task)
@@ -124,6 +155,8 @@ async def _ensure_started() -> bool:
 
 
 def is_active() -> bool:
+    """Engine armed. For lazy-start engines (restate) 'armed' precedes
+    'serving' — submit/status/signal drive the start themselves."""
     return _engine is not None
 
 
@@ -152,6 +185,19 @@ async def status(task_id: str) -> dict[str, Any] | None:
         return None
 
 
+async def meta(task_id: str) -> dict[str, Any] | None:
+    """Bounded poll projection (id/status/timestamps) — the default for the
+    status endpoint; pass ``full`` to get the serialized TaskState."""
+    try:
+        if not await _ensure_started():
+            return None
+        fn = getattr(_engine, "meta", None) or _engine.status
+        return await fn(task_id)
+    except Exception as e:
+        log.warning("durable meta(%s) failed: %s", task_id, e)
+        return None
+
+
 async def signal(task_id: str, action: str) -> bool:
     try:
         if not await _ensure_started():
@@ -165,12 +211,22 @@ async def signal(task_id: str, action: str) -> bool:
 async def tick() -> None:
     """job_loop reconcile — idempotent, safe every loop:
 
-    1. Submit each enabled config task (engines dedupe by task id).
-    2. Local engine only: re-attach runners for non-terminal tasks so work
+    1. Re-read config; a mid-process disable shuts the live engine down.
+    2. Submit each enabled config task (engines dedupe by task id). The
+       ``input`` wrapper unwraps — same shape as the API's {"input": {...}}.
+    3. Local engine only: re-attach runners for non-terminal tasks so work
        resumes after a process restart (restate replays server-side).
     Never raises — a bad tick must not stall the host's job loop.
     """
     try:
+        if (
+            _engine is not None
+            and _cfg_dynamic
+            and not _cfg_mod.truthy(_cfg_mod.get_config().get("enabled"))
+        ):
+            # host disabled the plugin mid-process — tear the engine down
+            await shutdown()
+            return
         if not await _ensure_started():
             return
         for task in _cfg.get("tasks") or []:
@@ -180,7 +236,15 @@ async def tick() -> None:
                 task_id = str(task.get("id") or "").strip()
                 if not task_id:
                     continue
-                await submit({**task, "id": task_id})
+                # documented shape: {id, enabled, input: {...}} — the payload
+                # is 'input' (same as the API's unwrap), everything else stays
+                # out of the journaled task input
+                payload = dict(task.get("input") or {})
+                for k, v in task.items():
+                    if k not in ("id", "enabled", "input"):
+                        payload.setdefault(k, v)
+                payload["id"] = task_id
+                await submit(payload)
             except Exception as e:
                 log.warning("durable tick: task submit failed: %s", e)
         # re-attach non-terminal tasks — a no-op on the restate engine (the
@@ -194,7 +258,7 @@ async def shutdown() -> None:
     """Stop plugin-owned services (restate ASGI endpoint, local runners).
     Journaled state survives — tasks resume on next configure+tick.
     Registry entries are host-owned and stay."""
-    global _engine, _engine_kind, _engine_started, _cfg, _start_task
+    global _engine, _engine_kind, _engine_started, _cfg, _cfg_dynamic, _start_task
     try:
         if _engine is not None:
             await _engine.stop()
@@ -206,26 +270,40 @@ async def shutdown() -> None:
         _engine_started = False
         _start_task = None
         _cfg = {}
+        _cfg_dynamic = False
 
 
 def _reset() -> None:
-    """Test/reload hook — teardown outside a running loop; also clears the
-    host step registry (shutdown() leaves it, this one is the full reset)."""
-    global _engine, _engine_kind, _engine_started, _cfg, _start_task
-    try:
-        engine = _engine
-        if engine is not None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                asyncio.run(engine.stop())
-            else:
-                loop.create_task(engine.stop())
-    except Exception:
-        pass
+    """Full teardown: engine stop THEN registry reset — clearing the registry
+    while runners live would turn their next step into a bogus
+    'no step registered' failure instead of a resumable interrupt. Called by
+    tests and by hooks.uninstall() (a0's unload path)."""
+    global _engine, _engine_kind, _engine_started, _cfg, _cfg_dynamic, _start_task
+    engine = _engine
     _engine = None
     _engine_kind = ""
     _engine_started = False
     _start_task = None
     _cfg = {}
+    _cfg_dynamic = False
+    if engine is not None:
+        async def _teardown() -> None:
+            try:
+                await engine.stop()
+            except Exception:
+                pass
+            registry.reset()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                asyncio.run(_teardown())
+            except Exception:
+                registry.reset()
+        else:
+            task = loop.create_task(_teardown())
+            _pending_stops.add(task)
+            task.add_done_callback(_pending_stops.discard)
+            return
     registry.reset()

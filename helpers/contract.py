@@ -5,8 +5,10 @@ between the engine adapters and the a0 agent loop. These types carry only
 JSON-serializable primitives so they cross engine boundaries (SQLite journal
 rows, Restate journal entries) without referencing live agent objects.
 
-Ported from Khan `helpers/durable/contract.py` — the Temporal-specific seam
-(``RetryPolicy.to_temporal``) lives in ``engines/restate.py`` instead.
+Ported from Khan `helpers/durable/contract.py` — the Temporal ``RetryPolicy``
+seam was dropped: local steps are bounded by ``step_timeout_s`` and Restate
+retry policy is server-configured, so no per-step retry options cross the
+engine boundary.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -25,7 +28,8 @@ class TaskStatus(StrEnum):
     """Lifecycle status for a durable agent task.
 
     Inherited from a string enum so values serialize naturally to JSON and are
-    comparable by identity or value.
+    comparable by identity or value. ``CHECKPOINTED`` is reserved — persisted
+    for contract parity but not yet written by either shipped engine.
     """
 
     CREATED = "created"
@@ -143,6 +147,23 @@ class TaskState:
             updated_at=_parse_dt(data.get("updated_at"), now=now),
         )
 
+    def _wire(self) -> dict[str, Any]:
+        """Serialization shape without the defensive deepcopy — json.dumps
+        never mutates, so the per-checkpoint copy is pure overhead. External
+        callers use ``to_dict()``; the journal hot path uses this."""
+
+        return {
+            "id": self.id,
+            "status": self.status.value,
+            "context_snapshot": self.context_snapshot,
+            "plan": self.plan,
+            "tool_results": self.tool_results,
+            "artifacts": self.artifacts,
+            "model_state": self.model_state,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
     def to_json(self) -> str:
         """Serialize to a JSON string.
 
@@ -150,7 +171,7 @@ class TaskState:
         drift across checkpoints is caught immediately.
         """
 
-        return json.dumps(self.to_dict(), sort_keys=True)
+        return json.dumps(self._wire(), sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str) -> TaskState:
@@ -163,9 +184,9 @@ class TaskState:
 class CheckpointData:
     """A single iteration checkpoint captured between step calls.
 
-    Persisted in the engine's journal/memo so a replayed task can resume from
-    the exact prompt messages, LLM result, and pending tool calls without
-    re-invoking the model.
+    Reserved — ported for contract parity with Khan but not yet consumed by
+    either shipped engine (local checkpoints via ``state_json``, restate via
+    ``ctx.set``). Do not wire assumptions onto this type.
     """
 
     iteration: int
@@ -198,11 +219,8 @@ class CheckpointData:
 class AgentStateSnapshot:
     """Serializable agent state for provider handoff / checkpoint restore.
 
-    Captures the minimal, JSON-safe slice of an ``Agent`` instance required to
-    resume the agent loop in a fresh process: the context data dict, the
-    history output, a serialized ``LoopData``-equivalent dict, and the agent's
-    free-form ``data`` dict. Live objects (model handles, log sinks) are not
-    carried; they are reconstructed by the host on resume.
+    Reserved — ported for contract parity; neither shipped engine consumes it
+    yet (the runner restores from ``TaskState``, not a live ``Agent``).
     """
 
     context: dict[str, Any] = field(default_factory=dict)
@@ -235,6 +253,12 @@ class AgentStateSnapshot:
         return cls.from_dict(json.loads(raw))
 
 
+# Known host-injection seams excluded from the idempotency hash. Only these
+# exact names are filtered — a model-supplied ``_anything_else`` still feeds
+# the digest, so different args can never share a memoized result.
+_INJECTION_ARGS = frozenset({"_call", "_result", "_transport"})
+
+
 class ToolIdempotencyKey:
     """Deterministic idempotency key for tool execution.
 
@@ -243,17 +267,17 @@ class ToolIdempotencyKey:
     key, so a replayed tool step can short-circuit on a cached result stored
     under that key in ``TaskState.tool_results``.
 
-    Underscore-prefixed arguments (host injection seams like ``_call``) are
-    excluded before hashing, and non-JSON-serializable argument values raise
-    ``TypeError`` instead of producing a meaningless digest.
+    Only the named host-injection seams (``_call``/``_result``/``_transport``)
+    are excluded before hashing, and non-JSON-serializable argument values
+    raise ``TypeError`` instead of producing a meaningless digest.
     """
 
     @staticmethod
     def build(tool_name: str, tool_args: dict[str, Any] | None) -> str:
         normalized = tool_name or ""
         args = tool_args or {}
-        # Exclude injection seams (underscore-prefixed keys) from the identity.
-        filtered = {k: v for k, v in args.items() if not k.startswith("_")}
+        # Exclude the named injection seams from the identity.
+        filtered = {k: v for k, v in args.items() if k not in _INJECTION_ARGS}
         # Sorted, separators-stable JSON so dict ordering never changes the hash.
         # No default=str: non-JSON args raise TypeError rather than hashing a
         # meaningless stringification.
@@ -288,28 +312,48 @@ def _parse_dt(value: Any, now: datetime | None = None) -> datetime:
 # helpers keep the pure parts identical so the engines cannot drift.
 
 
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Submitted task_input cap — the whole dict is journaled per task.
+MAX_INPUT_BYTES = 1 << 20  # 1 MiB
+
+
 def normalize_task_input(task_input: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
     """Resolve the task id — explicit ``id``, then ``state.id``, else a fresh
     uuid4 — and return ``(task_id, input)`` with ``id`` promoted to top level.
-    Id-keyed dedupe is what makes re-submission safe on every engine."""
+    Id-keyed dedupe is what makes re-submission safe on every engine.
+
+    Raises ``ValueError`` on an invalid caller-supplied id (it lands in sqlite
+    PRIMARY KEYs, Restate URL paths, and log lines) and on oversized input.
+    A caller-supplied ``state`` is dropped — engines hydrate task state from
+    their own journal, never from the wire, so a submission cannot forge
+    memoized step results or prompt history.
+    """
 
     data = dict(task_input or {})
-    task_id = str(data.get("id") or (data.get("state") or {}).get("id") or uuid.uuid4().hex)
+    raw_id = data.get("id") or (data.get("state") or {}).get("id")
+    task_id = str(raw_id) if raw_id is not None else uuid.uuid4().hex
+    if not _TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"invalid task id: {task_id!r}")
+    data.pop("state", None)  # see docstring — inbound state is never trusted
     data["id"] = task_id
+    if len(json.dumps(data)) > MAX_INPUT_BYTES:
+        raise ValueError("task input exceeds 1 MiB")
     return task_id, data
 
 
-def state_or_new(task_input: dict[str, Any]) -> TaskState:
-    """Hydrate TaskState from ``task_input['state']``; malformed input falls
-    back to a fresh state rather than raising inside an engine boundary."""
+def iter_cap(task_input: dict[str, Any], default: int) -> int:
+    """Per-task ``max_iterations`` override with the engine default as
+    fallback. Missing/invalid -> ``default``; valid values clamp to
+    ``[0, default * 10]`` so a submitter can't request an unbounded loop."""
 
-    raw = task_input.get("state")
+    raw = task_input.get("max_iterations")
+    if raw is None:
+        return default
     try:
-        if isinstance(raw, dict) and raw.get("id"):
-            return TaskState.from_dict(raw)
-    except Exception:
-        pass
-    return TaskState(id=str(task_input.get("id", "")))
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(max(val, 0), max(default, 1) * 10)
 
 
 def loop_inputs(state: TaskState, task_input: dict[str, Any]) -> tuple[list, dict]:

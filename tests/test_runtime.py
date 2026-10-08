@@ -152,6 +152,78 @@ def test_tick_resumes_incomplete_after_restart(local_cfg):
     run(_resumed())
 
 
+def test_tick_unwraps_input_and_skips_malformed(local_cfg):
+    """Documented config shape is {id, enabled, input: {...}} — 'input' is
+    the task payload; wrapper keys must not leak into the journaled input."""
+    got = []
+
+    async def llm(prompt_messages, model_config):
+        got.append(list(prompt_messages))
+        return {"tool_calls": []}
+
+    registry.register_step("llm_call", llm)
+    msg = {"role": "user", "content": "nightly"}
+    local_cfg["tasks"] = [
+        {"id": "job-1", "enabled": True,
+         "input": {"prompt_messages": [msg], "model_config": {"m": 1}}},
+        {"id": "job-off", "enabled": False, "input": {"prompt_messages": [msg]}},
+        "garbage",                    # non-dict entry — skipped, not fatal
+        {"enabled": True},            # no id — skipped
+    ]
+
+    async def _main():
+        runtime.configure(local_cfg)
+        await runtime.tick()
+        for _ in range(100):
+            st = await runtime.status("job-1")
+            if st and st.get("status") == "completed":
+                break
+            await asyncio.sleep(0.05)
+        st = await runtime.status("job-1")
+        assert st is not None and st["status"] == "completed"
+        assert got[0][0] == msg                       # prompt reached the step
+        row = runtime._engine.journal.get_task("job-1")
+        assert "enabled" not in row["input"]
+        assert "input" not in row["input"]
+        assert row["input"]["model_config"] == {"m": 1}
+        assert await runtime.status("job-off") is None
+
+    run(_main())
+
+
+def test_tick_dynamic_disable_shuts_engine(local_cfg, monkeypatch):
+    """Host-loaded config re-reads `enabled` per tick — a mid-process disable
+    must tear the live engine down. Programmatic cfg (dict arg) is exempt."""
+    live = {"v": local_cfg}
+    monkeypatch.setattr(
+        "usr.plugins.durable.helpers.config.get_config", lambda: live["v"]
+    )
+
+    async def _main():
+        runtime.configure()            # cfg=None → host-loaded → dynamic
+        assert runtime.is_active()
+        live["v"] = {"enabled": False}
+        await runtime.tick()
+        assert runtime.is_active() is False
+
+    run(_main())
+
+
+def test_configure_while_live_keeps_existing(local_cfg, journal_path):
+    """configure() must not silently swap a live engine — old runners would
+    double-execute against the shared journal."""
+    other = dict(local_cfg)
+    other["journal_path"] = str(journal_path) + ".other"
+
+    async def _main():
+        assert runtime.configure(local_cfg) is True
+        assert runtime.configure(other) is True   # kept, not replaced
+        row_engine = runtime._engine
+        assert row_engine.journal._path == local_cfg["journal_path"]
+
+    run(_main())
+
+
 def test_shutdown_clears(local_cfg):
     async def _main():
         runtime.configure(local_cfg)

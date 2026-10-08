@@ -19,8 +19,10 @@ class DurableSignal(ApiHandler):
 
         if not runtime.is_active():
             return {"ok": False, "error": "durable inactive (disabled or engine unavailable)"}
-        task_id = str((input or {}).get("task_id") or "").strip()
-        action = str((input or {}).get("action") or "").strip().lower()
+        if not isinstance(input, dict):
+            return {"ok": False, "error": "object body required"}
+        task_id = str(input.get("task_id") or "").strip()
+        action = str(input.get("action") or "").strip().lower()
         if not task_id or action not in ("pause", "resume", "cancel"):
             return {"ok": False, "error": "task_id + action (pause|resume|cancel) required"}
         ok = await runtime.signal(task_id, action)

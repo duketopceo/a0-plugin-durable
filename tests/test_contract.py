@@ -9,6 +9,11 @@ from usr.plugins.durable.helpers.contract import (
     TaskState,
     TaskStatus,
     ToolIdempotencyKey,
+    iter_cap,
+    json_or,
+    loop_inputs,
+    normalize_task_input,
+    tool_message,
 )
 
 
@@ -110,3 +115,63 @@ def test_taskstatus_values_stable():
         "created", "planned", "executing", "checkpointed",
         "paused", "resumed", "completed", "failed",
     }
+
+
+def test_normalize_task_input_drops_wire_state():
+    """A submitted 'state' is never trusted — engines hydrate from their own
+    journal, so wire state can't forge memoized steps or prompt history."""
+    tid, data = normalize_task_input(
+        {"id": "t1", "state": {"status": "completed", "tool_results": {"x": {}}}}
+    )
+    assert tid == "t1" and "state" not in data
+    # state.id still resolves the task id before the payload is dropped
+    tid2, data2 = normalize_task_input({"state": {"id": "t2"}, "k": 1})
+    assert tid2 == "t2"
+    assert data2 == {"id": "t2", "k": 1}
+
+
+def test_normalize_task_input_rejects_bad_ids():
+    for bad in ("../escape", "has space", "x" * 200, "sl@sh"):
+        with pytest.raises(ValueError):
+            normalize_task_input({"id": bad})
+    # absent id mints a fresh one rather than raising
+    tid, data = normalize_task_input({})
+    assert tid and data["id"] == tid
+
+
+def test_normalize_task_input_caps_size():
+    with pytest.raises(ValueError, match="1 MiB"):
+        normalize_task_input({"blob": "x" * (1 << 20)})
+
+
+def test_iter_cap_defaults_and_clamps():
+    assert iter_cap({}, 10) == 10
+    assert iter_cap({"max_iterations": "bogus"}, 10) == 10
+    assert iter_cap({"max_iterations": None}, 10) == 10
+    assert iter_cap({"max_iterations": 0}, 10) == 0
+    assert iter_cap({"max_iterations": -5}, 10) == 0
+    # a submitter can tighten the loop but not request an unbounded one
+    assert iter_cap({"max_iterations": 10**9}, 10) == 100
+
+
+def test_loop_inputs_checkpoint_wins_over_raw_input():
+    state = TaskState(
+        id="t",
+        context_snapshot={"prompt_messages": [{"m": "checkpointed"}]},
+        model_state={"model_config": {"a": 1}},
+    )
+    msgs, cfg = loop_inputs(
+        state, {"prompt_messages": [{"m": "raw"}], "model_config": {"b": 2}}
+    )
+    assert msgs == [{"m": "checkpointed"}]
+    assert cfg == {"a": 1}
+
+
+def test_tool_message_and_json_or():
+    assert tool_message("w", {"result": "ok"}) == {
+        "role": "tool", "name": "w", "content": "ok",
+    }
+    assert tool_message("w", {})["content"] == ""
+    assert json_or(b'{"a": 1}') == {"a": 1}
+    assert json_or("{corrupt", "d") == "d"
+    assert json_or(None, "d") == "d"
