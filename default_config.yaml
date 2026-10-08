@@ -1,0 +1,40 @@
+# a0-plugin-durable — durable execution for agent tasks.
+#
+# Everything is opt-in: with `enabled: false` the plugin is fully inert.
+
+# Master switch. Env override: DURABLE_ENABLED=1
+enabled: false
+
+# Engine selection: "local" (zero-dep SQLite journal, default) or
+# "restate" (requires `pip install restate_sdk hypercorn` and a running
+# Restate server). Env override: DURABLE_ENGINE
+engine: local
+
+# --- local engine ----------------------------------------------------------
+# SQLite journal file. Empty = <plugin>/data/durable.sqlite3 (created lazily).
+# Env override: DURABLE_JOURNAL_PATH
+journal_path: ""
+
+# Per-step timeout (seconds) applied to journaled steps.
+step_timeout_s: 300
+
+# Hard cap on agent-loop iterations per task — guards against runaway loops.
+max_iterations: 100
+
+# Declarative tasks the job_loop tick submits idempotently (a task row that
+# already exists is not re-submitted). Shape:
+#   tasks:
+#     - id: nightly-cleanup
+#       input: {prompt_messages: [{role: user, content: "..."}]}
+tasks: []
+
+# --- restate engine --------------------------------------------------------
+# Restate ingress (client submit/query). Env: DURABLE_RESTATE_INGRESS
+restate_ingress: "http://127.0.0.1:8080"
+
+# Restate admin API (deployment registration). Env: DURABLE_RESTATE_ADMIN
+restate_admin: "http://127.0.0.1:9070"
+
+# Port the in-process ASGI endpoint listens on — Restate invokes handlers
+# back into a0 on this port. Env: DURABLE_LISTEN_PORT
+listen_port: 9080

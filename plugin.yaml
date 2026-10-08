@@ -1,0 +1,11 @@
+name: durable
+title: Durable Execution
+description: >
+  Durable, restart-survivable agent tasks. Engine-agnostic contract with a
+  zero-dependency local SQLite-journal engine (default) and an optional
+  Restate adapter for operators running the Restate sidecar. Extracted from
+  the Khan fork's Temporal-shaped helpers/durable/.
+version: 0.1.0
+settings_sections:
+  - id: external
+    title: External services

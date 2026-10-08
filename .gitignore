@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.DS_Store
+
+# runtime state — the journal and its WAL artifacts are data, not source
+data/
+
+# local agent tooling (see a0-plugin-omaseal convention)
+.devin/
+.codebase-memory/

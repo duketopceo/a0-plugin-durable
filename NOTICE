@@ -1,0 +1,30 @@
+# NOTICE
+
+This repository (**a0-plugin-durable**, `duketopceo/a0-plugin-durable`)
+is a plugin for [Agent Zero](https://github.com/agent0ai/agent-zero).
+
+## Upstream
+
+Agent Zero is licensed under the MIT License by **Agent Zero, s.r.o**
+(contact: pr@agent-zero.ai). No upstream source files are vendored here, but
+this plugin targets Agent Zero's plugin APIs and adapts patterns from it.
+
+## Provenance
+
+- The extraction spec, the task-state contract (`helpers/contract.py`), and
+  the agent-loop workflow shape come from the Khan fork's
+  `helpers/durable/` (https://github.com/duketopceo/khan), itself
+  MIT-licensed work by Luke Kimball / duketopceo.
+- Khan's adapter targeted Temporal via `temporalio`; this plugin drops the
+  Temporal dependency entirely. The `restate` engine targets the Restate
+  Python SDK (`restate_sdk`, Apache-2.0) served through `hypercorn`
+  (MIT) — both optional, imported lazily only when `engine: restate`.
+- The default `local` engine is original work: a zero-dependency SQLite
+  step journal + in-process runner.
+
+## This plugin
+
+Original work here is Copyright (c) 2026 Luke Kimball / duketopceo, released
+under the MIT terms in `LICENSE`.
+
+Preserve the upstream copyright notice and this NOTICE when redistributing.
