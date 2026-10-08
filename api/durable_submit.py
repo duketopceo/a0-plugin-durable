@@ -21,7 +21,9 @@ class DurableSubmit(ApiHandler):
             return {"ok": False, "error": "durable inactive (disabled or engine unavailable)"}
         task_input = input.get("input") if isinstance(input, dict) else None
         if not isinstance(task_input, dict):
-            task_input = input if isinstance(input, dict) else {}
+            task_input = {k: v for k, v in input.items() if k != "input"} if isinstance(input, dict) else {}
+        if not task_input:
+            return {"ok": False, "error": "empty task input"}
         task_id = await runtime.submit(task_input)
         if task_id is None:
             return {"ok": False, "error": "submit failed — see server logs"}

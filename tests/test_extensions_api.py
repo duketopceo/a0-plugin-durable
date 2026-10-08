@@ -120,12 +120,16 @@ def test_api_handlers_require_auth():
 
 
 def test_hooks_install_uninstall(local_cfg, monkeypatch):
+    """install() is log-only (startup_migration owns configure); uninstall()
+    tears the engine down and is idempotent."""
     monkeypatch.setattr(
         "usr.plugins.durable.helpers.config.get_config", lambda: local_cfg
     )
     import usr.plugins.durable.hooks as hooks
 
     hooks.install()
+    assert runtime.is_active() is False  # configure happens in the extension
+    runtime.configure(local_cfg)
     assert runtime.is_active()
     hooks.uninstall()
     assert runtime.is_active() is False

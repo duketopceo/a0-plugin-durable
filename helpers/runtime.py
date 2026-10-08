@@ -75,6 +75,10 @@ def configure(cfg: dict[str, Any] | None = None) -> bool:
                     ingress=str(_cfg.get("restate_ingress", "")),
                     admin=str(_cfg.get("restate_admin", "")),
                     listen_port=int(_cfg_mod.num(_cfg.get("listen_port"), 9080)),
+                    defaults={
+                        "max_iterations": int(_cfg_mod.num(_cfg.get("max_iterations"), 100)),
+                        "step_timeout_s": _cfg_mod.num(_cfg.get("step_timeout_s"), 300),
+                    },
                 )
                 if not engine.available:
                     log.warning(
@@ -94,19 +98,25 @@ def configure(cfg: dict[str, Any] | None = None) -> bool:
             return False
 
 
+_start_task: asyncio.Task | None = None
+
+
 async def _ensure_started() -> bool:
     """Start the engine's serving side on first async use (restate only;
-    local is already started). Never raises."""
-    global _engine_started
+    local is already started). Concurrent callers share one start task —
+    two starts would double-bind the ASGI port. Never raises."""
+    global _engine_started, _start_task
     if _engine is None:
         return False
     if _engine_started:
         return True
     try:
-        if _engine_kind == "restate":
-            _engine_started = await _engine.start()
-        else:
+        if _engine_kind != "restate":
             _engine_started = True
+            return True
+        if _start_task is None or _start_task.done():
+            _start_task = asyncio.get_running_loop().create_task(_engine.start())
+        _engine_started = bool(await _start_task)
         return _engine_started
     except Exception as e:
         log.warning("durable: engine start failed: %s", e)
@@ -173,50 +183,49 @@ async def tick() -> None:
                 await submit({**task, "id": task_id})
             except Exception as e:
                 log.warning("durable tick: task submit failed: %s", e)
-        journal = getattr(_engine, "journal", None)
-        attach = getattr(_engine, "attach", None)
-        if journal is not None and attach is not None:
-            for task_id in journal.incomplete_tasks():
-                attach(task_id)
+        # re-attach non-terminal tasks — a no-op on the restate engine (the
+        # server replays independently of a0's process)
+        _engine.resume_incomplete()
     except Exception as e:
         log.warning("durable tick failed: %s", e)
 
 
 async def shutdown() -> None:
     """Stop plugin-owned services (restate ASGI endpoint, local runners).
-    Journaled state survives — tasks resume on next configure+tick."""
-    global _engine, _engine_kind, _engine_started
+    Journaled state survives — tasks resume on next configure+tick.
+    Registry entries are host-owned and stay."""
+    global _engine, _engine_kind, _engine_started, _cfg, _start_task
     try:
         if _engine is not None:
-            stop = getattr(_engine, "stop", None)
-            if stop is not None:
-                await stop()
+            await _engine.stop()
     except Exception as e:
         log.warning("durable shutdown failed: %s", e)
     finally:
         _engine = None
         _engine_kind = ""
         _engine_started = False
+        _start_task = None
+        _cfg = {}
 
 
 def _reset() -> None:
-    """Test/reload hook — teardown outside a running loop."""
-    global _engine, _engine_kind, _engine_started
+    """Test/reload hook — teardown outside a running loop; also clears the
+    host step registry (shutdown() leaves it, this one is the full reset)."""
+    global _engine, _engine_kind, _engine_started, _cfg, _start_task
     try:
         engine = _engine
         if engine is not None:
-            stop = getattr(engine, "stop", None)
-            if stop is not None:
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    asyncio.run(stop())
-                else:
-                    loop.create_task(stop())
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(engine.stop())
+            else:
+                loop.create_task(engine.stop())
     except Exception:
         pass
     _engine = None
     _engine_kind = ""
     _engine_started = False
+    _start_task = None
     _cfg = {}
     registry.reset()

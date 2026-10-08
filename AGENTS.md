@@ -43,9 +43,15 @@ tests/                standalone conftest stubs helpers.{extension,plugins,api}
   trusting a partial write. `step_result` only returns `done` rows.
 - **Pause survives restart.** A task row left `paused` at shutdown stays
   paused when re-attached (`_run` checks the row before forcing EXECUTING).
-  `asyncio.Event` wake-ups are an in-process accelerator only.
+  Local pause is a bare `asyncio.Event` wait (the journal is single-process,
+  so `signal()` can never miss a wake); Restate pause awaits a durable
+  promise `resume_{pause_epoch}` — zero journal churn either way.
 - **Terminal statuses are `{completed, failed}`.** `cancel` → `failed`
-  (contract has no cancelled). `signal()` refuses terminal rows.
+  (contract has no cancelled). `contract.TERMINAL_VALUES`/`SIGNAL_ACTIONS`
+  are the single source of truth — journal, engines, and api all share them.
+- **`tasks.status` is authoritative.** `state_json.status` mirrors it for
+  serialization but signals only write the column — `status()` overlays
+  column state onto the state dict before returning.
 - **`startup_migration` is SYNC.** a0's `call_extensions_sync` raises if
   `execute()` returns an awaitable — `_60_durable_init.py` must stay
   `def`, not `async def`. Restate serving starts lazily on first async
@@ -63,9 +69,10 @@ tests/                standalone conftest stubs helpers.{extension,plugins,api}
 
 - Journal schema → bump nothing (plugin is pre-1.0) but migrate `init`
   reset logic if `steps` columns change.
-- Engine interface (`submit`/`signal`/`status`/`stop`/`attach`) → keep all
-  signatures identical across `local`/`restate`; `runtime` does no
-  engine-specific branching beyond `journal`/`attach` duck-typing.
+- Engine interface (`submit`/`signal`/`status`/`stop`/`attach`/
+  `resume_incomplete`) → keep all signatures identical across
+  `local`/`restate`; `runtime.tick()` calls `resume_incomplete()` on both
+  (restate no-ops — the server replays independently).
 - Config keys → `DEFAULTS`, `default_config.yaml`, `_ENV_MAP`, README table
   all move together.
 - Extension prefixes → `_60_` keeps durable after housekeeping jobs; sync

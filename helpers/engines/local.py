@@ -21,21 +21,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from typing import Any
 
 from usr.plugins.durable.helpers import LOG_NAME, registry
-from usr.plugins.durable.helpers.contract import TaskState, TaskStatus, ToolIdempotencyKey
+from usr.plugins.durable.helpers.contract import (
+    SIGNAL_ACTIONS,
+    TERMINAL_VALUES,
+    TaskState,
+    TaskStatus,
+    ToolIdempotencyKey,
+    loop_inputs,
+    normalize_task_input,
+    tool_calls_of,
+    tool_message,
+)
 from usr.plugins.durable.helpers.journal import Journal
 
 log = logging.getLogger(LOG_NAME)
 
-_TERMINAL = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value}
-_PAUSE_POLL_S = 0.5
-
 
 class LocalEngine:
-    """Engine interface: submit/signal/status/attach/stop."""
+    """Engine interface: submit/signal/status/attach/resume_incomplete/stop."""
 
     def __init__(self, journal: Journal, *, step_timeout_s: float, max_iterations: int) -> None:
         self.journal = journal
@@ -47,25 +53,20 @@ class LocalEngine:
     # --- engine interface ----------------------------------------------------
 
     async def submit(self, task_input: dict[str, Any]) -> str | None:
-        """Create the task row idempotently and spawn the runner."""
+        """Create the task row idempotently and spawn the runner only when
+        the row is new — re-submitted ids (e.g. every job_loop tick) must not
+        churn a throwaway runner against an existing/terminal task."""
         try:
-            task_input = dict(task_input or {})
-            task_id = str(
-                task_input.get("id")
-                or (task_input.get("state") or {}).get("id")
-                or uuid.uuid4().hex
-            )
-            task_input["id"] = task_id
-            self.journal.create_task(task_id, task_input)
-            self.attach(task_id)
+            task_id, task_input = normalize_task_input(task_input)
+            if self.journal.create_task(task_id, task_input):
+                self.attach(task_id)
             return task_id
         except Exception as e:
             log.warning("local engine submit failed: %s", e)
             return None
 
     def attach(self, task_id: str) -> None:
-        """Spawn a runner for an existing task if none is live — the
-        resume-after-restart path (called by the job_loop tick)."""
+        """Spawn a runner for an existing task if none is live."""
         try:
             existing = self._runners.get(task_id)
             if existing is not None and not existing.done():
@@ -77,21 +78,23 @@ class LocalEngine:
         except Exception as e:
             log.warning("local engine attach(%s) failed: %s", task_id, e)
 
+    def resume_incomplete(self) -> None:
+        """Re-attach runners for every non-terminal task — the restart path
+        driven by the job_loop tick."""
+        for task_id in self.journal.incomplete_tasks():
+            self.attach(task_id)
+
     async def signal(self, task_id: str, action: str) -> bool:
         """pause / resume / cancel — persisted to the task row first, then
         the in-memory wake event so a running task reacts promptly."""
         try:
-            row = self.journal.get_task(task_id)
-            if row is None or row["status"] in _TERMINAL:
+            status = self.journal.get_status(task_id)
+            if status is None or status in TERMINAL_VALUES:
                 return False  # nothing to signal on a terminal/unknown task
-            if action == "pause":
-                self.journal.update_task(task_id, status=TaskStatus.PAUSED)
-            elif action == "resume":
-                self.journal.update_task(task_id, status=TaskStatus.RESUMED)
-            elif action == "cancel":
-                self.journal.update_task(task_id, status=TaskStatus.FAILED)
-            else:
+            target = SIGNAL_ACTIONS.get(action)
+            if target is None:
                 return False
+            self.journal.update_task(task_id, status=target)
             ev = self._wake.get(task_id)
             if ev is not None:
                 ev.set()
@@ -106,20 +109,27 @@ class LocalEngine:
             return None
         state = row.get("state") or {}
         state.setdefault("id", task_id)
-        state.setdefault("status", row.get("status"))
+        # the status column is authoritative — state_json may lag a signal
+        state["status"] = row["status"]
         return state
 
     async def stop(self) -> None:
-        """Cancel live runners; journaled state makes them resumable."""
-        for task_id, runner in list(self._runners.items()):
+        """Cancel live runners and await their teardown — uninstall() needs
+        steps settled into a torn ('running') or terminal state before it
+        returns. Journaled state makes every survivor resumable."""
+        runners = [t for t in self._runners.values() if not t.done()]
+        for runner in runners:
             try:
-                if not runner.done():
-                    runner.cancel()
-                    # leave status non-terminal — journal stays resume-ready
+                runner.cancel()
             except Exception:
                 pass
+        if runners:
+            await asyncio.gather(*runners, return_exceptions=True)
         self._runners.clear()
         self._wake.clear()
+        close = getattr(self.journal, "close", None)
+        if close is not None:
+            close()
 
     # --- runner ---------------------------------------------------------------
 
@@ -127,14 +137,13 @@ class LocalEngine:
         """Agent-loop-shaped durable runner. All journal/state errors are
         contained: worst case the task lands FAILED, never the host."""
         try:
-            row = self.journal.get_task(task_id)
-            if row is None:
+            row_status = self.journal.get_status(task_id)
+            if row_status is None or row_status in TERMINAL_VALUES:
                 return
-            if row["status"] in _TERMINAL:
-                return
-            task_input = row["input"]
+            row = self.journal.get_task(task_id) or {}
+            task_input = row.get("input") or {}
             state = TaskState.from_dict(row["state"]) if row.get("state") else TaskState(id=task_id)
-            if row["status"] == TaskStatus.PAUSED.value:
+            if row_status == TaskStatus.PAUSED.value:
                 # paused at shutdown must STAY paused — hydrate the checkpoint
                 # but do not flip the row; _await_if_paused parks on it
                 self.journal.update_task(task_id, state=state)
@@ -144,10 +153,7 @@ class LocalEngine:
                 state.transition_to(TaskStatus.EXECUTING)
                 self.journal.update_task(task_id, status=TaskStatus.EXECUTING, state=state)
 
-            messages = list(state.context_snapshot.get("prompt_messages")
-                            or task_input.get("prompt_messages") or [])
-            model_cfg = dict(state.model_state.get("model_config")
-                             or task_input.get("model_config") or {})
+            messages, model_cfg = loop_inputs(state, task_input)
 
             for iteration in range(self.max_iterations):
                 if self._halted(task_id):
@@ -164,7 +170,7 @@ class LocalEngine:
                     self._fail(task_id, state)
                     return
 
-                tool_calls = llm_result.get("tool_calls", []) if isinstance(llm_result, dict) else []
+                tool_calls = tool_calls_of(llm_result)
                 if not tool_calls:
                     state.context_snapshot["final_response"] = llm_result
                     self._complete(task_id, state)
@@ -177,26 +183,27 @@ class LocalEngine:
                     name = str(tc.get("name", ""))
                     args = dict(tc.get("args", {}) or {})
                     key = ToolIdempotencyKey.build(name, args)
-                    tr = await self._step(
-                        task_id, f"iter{iteration}:tool:{key}", "tool_call",
-                        tool_name=name, tool_args=args, idempotency_key=key,
-                    )
+                    # same idempotency key => same memoized result (par with
+                    # the restate engine) — on top of the step journal
+                    tr = state.tool_results.get(key)
+                    if tr is None:
+                        tr = await self._step(
+                            task_id, f"iter{iteration}:tool:{key}", "tool_call",
+                            tool_name=name, tool_args=args, idempotency_key=key,
+                        )
                     if tr is None:
                         self._fail(task_id, state)
                         return
                     state.tool_results[key] = tr
                     state.touch()
-                    messages.append({"role": "tool", "name": name,
-                                     "content": tr.get("result", "")})
+                    messages.append(tool_message(name, tr))
                     if tr.get("break_loop"):
                         state.context_snapshot["final_response"] = tr
                         self._complete(task_id, state)
                         return
                 # checkpoint: persist state incl. updated tool_results/messages
                 state.context_snapshot["prompt_messages"] = messages
-                state.transition_to(TaskStatus.CHECKPOINTED)
-                state.transition_to(TaskStatus.EXECUTING)
-                self.journal.update_task(task_id, status=TaskStatus.EXECUTING, state=state)
+                self.journal.update_task(task_id, state=state)
 
             # iteration cap reached — Khan semantics: complete
             state.context_snapshot["final_response"] = {
@@ -208,6 +215,9 @@ class LocalEngine:
         except Exception as e:
             log.warning("local runner for %s crashed: %s", task_id, e)
             self.journal.update_task(task_id, status=TaskStatus.FAILED)
+        finally:
+            self._runners.pop(task_id, None)
+            self._wake.pop(task_id, None)
 
     async def _step(self, task_id: str, step_key: str, name: str, **kwargs):
         """Journaled step: memoized hit returns without executing; miss runs
@@ -233,20 +243,22 @@ class LocalEngine:
             return None
 
     async def _await_if_paused(self, task_id: str) -> None:
+        """Park while the row is paused. The journal is single-process, so
+        signal() always sets this Event — a bare wait cannot miss a wake.
+        The second status check sits between clear() and the await so a
+        resume racing the clear can't be lost (no yield between them —
+        nothing can interleave until the wait suspends)."""
         ev = self._wake.setdefault(task_id, asyncio.Event())
         while True:
-            row = self.journal.get_task(task_id) or {}
-            if row.get("status") != TaskStatus.PAUSED.value:
+            if self.journal.get_status(task_id) != TaskStatus.PAUSED.value:
                 return
             ev.clear()
-            try:
-                await asyncio.wait_for(ev.wait(), timeout=_PAUSE_POLL_S)
-            except asyncio.TimeoutError:
-                pass  # poll the row again — covers a missed/lost wake event
+            if self.journal.get_status(task_id) != TaskStatus.PAUSED.value:
+                return
+            await ev.wait()
 
     def _halted(self, task_id: str) -> bool:
-        row = self.journal.get_task(task_id) or {}
-        return row.get("status") in _TERMINAL
+        return self.journal.get_status(task_id) in TERMINAL_VALUES
 
     def _complete(self, task_id: str, state: TaskState) -> None:
         state.transition_to(TaskStatus.COMPLETED)

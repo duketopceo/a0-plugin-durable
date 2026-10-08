@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -46,8 +47,23 @@ class TaskStatus(StrEnum):
 
         if self is target:
             return True
-        terminal = {TaskStatus.COMPLETED, TaskStatus.FAILED}
-        return self not in terminal
+        return self not in TERMINAL_STATUSES
+
+
+# Single source of truth for "no further transitions" — the journal query,
+# engine runners, and signal handling all consume this.
+TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED}
+)
+TERMINAL_VALUES: frozenset[str] = frozenset(s.value for s in TERMINAL_STATUSES)
+
+# api/engine signal verbs -> the status they persist. Membership in this map
+# is the validity check everywhere.
+SIGNAL_ACTIONS: dict[str, TaskStatus] = {
+    "pause": TaskStatus.PAUSED,
+    "resume": TaskStatus.RESUMED,
+    "cancel": TaskStatus.FAILED,  # contract has no 'cancelled' — cancel is terminal
+}
 
 
 @dataclass
@@ -249,20 +265,82 @@ class ToolIdempotencyKey:
 def _parse_dt(value: Any, now: datetime | None = None) -> datetime:
     """Parse an ISO datetime string, making naive values UTC-aware.
 
-    Already-aware ``datetime`` values pass through unchanged. Naive ISO strings
-    are assumed to be UTC. When ``value`` is absent, ``now`` is used if supplied
-    (an engine's deterministic clock); otherwise the wall clock.
+    Aware ``datetime`` values pass through unchanged; naive ones are assumed
+    UTC — same convention as naive ISO strings. When ``value`` is absent,
+    ``now`` is used if supplied (an engine's deterministic clock); otherwise
+    the wall clock.
     """
 
     if isinstance(value, datetime):
-        return value
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     if isinstance(value, str) and value:
         try:
             parsed = datetime.fromisoformat(value)
         except ValueError:
             pass
         else:
-            if parsed.tzinfo is None:
-                return parsed.replace(tzinfo=UTC)
-            return parsed
+            return _parse_dt(parsed, now=now)
     return now if now is not None else datetime.now(UTC)
+
+
+# --- shared agent-loop data-shaping -----------------------------------------
+# Both engines run the same llm_call → tool_calls → checkpoint loop; these
+# helpers keep the pure parts identical so the engines cannot drift.
+
+
+def normalize_task_input(task_input: dict[str, Any] | None) -> tuple[str, dict[str, Any]]:
+    """Resolve the task id — explicit ``id``, then ``state.id``, else a fresh
+    uuid4 — and return ``(task_id, input)`` with ``id`` promoted to top level.
+    Id-keyed dedupe is what makes re-submission safe on every engine."""
+
+    data = dict(task_input or {})
+    task_id = str(data.get("id") or (data.get("state") or {}).get("id") or uuid.uuid4().hex)
+    data["id"] = task_id
+    return task_id, data
+
+
+def state_or_new(task_input: dict[str, Any]) -> TaskState:
+    """Hydrate TaskState from ``task_input['state']``; malformed input falls
+    back to a fresh state rather than raising inside an engine boundary."""
+
+    raw = task_input.get("state")
+    try:
+        if isinstance(raw, dict) and raw.get("id"):
+            return TaskState.from_dict(raw)
+    except Exception:
+        pass
+    return TaskState(id=str(task_input.get("id", "")))
+
+
+def loop_inputs(state: TaskState, task_input: dict[str, Any]) -> tuple[list, dict]:
+    """(messages, model_config) — checkpointed values win over the raw input
+    so a resumed task continues from where it checkpointed."""
+
+    messages = list(
+        state.context_snapshot.get("prompt_messages") or task_input.get("prompt_messages") or []
+    )
+    model_cfg = dict(
+        state.model_state.get("model_config") or task_input.get("model_config") or {}
+    )
+    return messages, model_cfg
+
+
+def tool_calls_of(llm_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if isinstance(llm_result, dict):
+        calls = llm_result.get("tool_calls")
+        if isinstance(calls, list):
+            return calls
+    return []
+
+
+def tool_message(name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
+    return {"role": "tool", "name": name, "content": tool_result.get("result", "")}
+
+
+def json_or(raw: Any, default: Any = None) -> Any:
+    """json.loads that tolerates bytes/str/None and never raises."""
+
+    try:
+        return json.loads(raw) if raw else default
+    except Exception:
+        return default

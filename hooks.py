@@ -1,22 +1,21 @@
 """Plugin lifecycle hooks — a0 calls install()/uninstall() on load/unload.
 
-uninstall() must stop plugin-owned services cleanly (issue acceptance):
-the restate ASGI endpoint thread and any live local runners. Journaled
-state persists — tasks resume on the next install+tick.
+install() deliberately does NOT configure the engine: a0's plugin loader
+calls hooks before the runtime config layer is guaranteed ready, so the
+sync `startup_migration` extension owns configure(). uninstall() stops all
+plugin-owned services (restate ASGI endpoint thread, live local runners);
+journaled state survives on disk — tasks resume on next install+tick.
 """
 
 from __future__ import annotations
 
+import logging
+
 
 def install() -> None:
-    """No-op — the sync startup_migration extension performs configure()
-    once a0's runtime (and its config layer) is up."""
-    try:
-        from usr.plugins.durable.helpers import runtime
-
-        runtime.configure()
-    except Exception:
-        pass
+    logging.getLogger("a0.durable").info(
+        "durable plugin installed — engine configures at startup_migration"
+    )
 
 
 def uninstall() -> None:

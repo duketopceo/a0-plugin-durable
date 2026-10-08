@@ -84,8 +84,10 @@ All inherit a0 `ApiHandler` auth + CSRF. `cancel` marks the task `failed` (the c
 ## Limits
 
 - `max_iterations` (default 100) caps the agent loop per task.
-- `step_timeout_s` (default 300) bounds each journaled step.
-- `local` engine pause polls the row every 0.5s; signals are wake-accelerated in-process.
+- `step_timeout_s` (default 300) bounds each journaled step (local engine).
+- Pause is event-driven on both engines — a paused local task costs nothing until signalled; a paused Restate workflow awaits a durable promise (no journal churn).
+- The journal is append-only — `steps`/`tasks` rows accumulate for the life of `data/durable.sqlite3`. No retention policy yet; prune by deleting the file or older rows if it grows.
+- `llm_call`/`tool_call` have no default wiring — the host registers them (see "Task shape"). Submitted tasks without an `llm_call` registration fail cleanly.
 - Journal lives under `data/` — gitignored. Back it up or delete it with the plugin.
 
 ## Development
