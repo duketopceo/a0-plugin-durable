@@ -1,0 +1,54 @@
+# a0-plugin-durable — durable execution for agent tasks.
+#
+# Everything is opt-in: with `enabled: false` the plugin is fully inert.
+# Toggling enabled off while the plugin is running shuts the engine down on
+# the next job_loop tick.
+
+# Master switch. Env override: DURABLE_ENABLED=1
+enabled: false
+
+# Engine selection: "local" (zero-dep SQLite journal, default) or
+# "restate" (requires `pip install restate_sdk hypercorn` and a running
+# Restate server). Env override: DURABLE_ENGINE
+engine: local
+
+# --- shared ---------------------------------------------------------------
+# Hard cap on agent-loop iterations per task — guards against runaway loops.
+# Per-task override: max_iterations inside a submission's input (clamped to
+# 10x this value).
+max_iterations: 100
+
+# Declarative tasks the job_loop tick submits idempotently — ONE-SHOT per
+# id: an existing task row is never re-submitted, so editing a task's input
+# later has no effect until the id changes. Shape:
+#   tasks:
+#     - id: nightly-cleanup
+#       enabled: true            # optional, default true
+#       input: {prompt_messages: [{role: user, content: "..."}]}
+tasks: []
+
+# --- local engine ----------------------------------------------------------
+# SQLite journal file. Empty = <plugin>/data/durable.sqlite3 (created lazily).
+# Must live on a LOCAL filesystem (WAL needs POSIX locking — no NFS/SMB) and
+# be written by exactly one a0 process (no cross-process lease). Env
+# override: DURABLE_JOURNAL_PATH
+journal_path: ""
+
+# Per-step timeout (seconds) applied to journaled steps.
+step_timeout_s: 300
+
+# Max concurrent task runners; over the cap, submissions stay journaled and
+# attach on a later tick. Env override: DURABLE_MAX_CONCURRENT
+max_concurrent: 8
+
+# --- restate engine --------------------------------------------------------
+# Restate ingress (client submit/query). Env: DURABLE_RESTATE_INGRESS
+restate_ingress: "http://127.0.0.1:8080"
+
+# Restate admin API (deployment registration). Env: DURABLE_RESTATE_ADMIN
+restate_admin: "http://127.0.0.1:9070"
+
+# Port the in-process ASGI endpoint listens on — Restate invokes handlers
+# back into a0 on this port. Loopback only: the Restate server must run on
+# the same host as a0. Env: DURABLE_LISTEN_PORT
+listen_port: 9080
