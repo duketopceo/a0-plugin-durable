@@ -322,6 +322,23 @@ def test_signal_negatives(journal_path):
     run(_main())
 
 
+def test_signal_cas_loses_to_concurrent_terminal(journal_path):
+    """Race: terminal lands between signal's get_status pre-read and the
+    update — the non_terminal_only CAS must catch what the pre-read missed."""
+    async def _main():
+        eng = _make(journal_path)
+        eng.journal.create_task("t", {})
+        eng.journal.update_task("t", status=TaskStatus.FAILED)
+        # pre-read sees a stale non-terminal snapshot; CAS sees the real row
+        real_get_status = eng.journal.get_status
+        eng.journal.get_status = lambda _id: "executing"  # type: ignore[method-assign]
+        assert await eng.signal("t", "resume") is False
+        assert real_get_status("t") == "failed"
+        assert "t" not in eng._runners  # no runner attached on a lost CAS
+
+    run(_main())
+
+
 def test_paused_task_not_auto_attached_then_resume(journal_path):
     """Resume-on-demand: a paused row must NOT get a runner from
     resume_incomplete (ticks would accumulate parked runners); the explicit

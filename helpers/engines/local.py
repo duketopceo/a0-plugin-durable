@@ -134,8 +134,12 @@ class LocalEngine:
             target = SIGNAL_ACTIONS.get(action)
             if target is None:
                 return False
-            if not self.journal.update_task(task_id, status=target):
-                return False  # don't ack a signal that didn't persist
+            if not self.journal.update_task(
+                task_id, status=target, non_terminal_only=True
+            ):
+                return False  # don't ack a signal that didn't persist —
+                # CAS also closes the read-then-write race against a
+                # terminal status landing between get_status and update
             if action == "resume":
                 # no runner may be live (paused tasks don't auto-attach);
                 # spawn one now rather than waiting for the next tick
