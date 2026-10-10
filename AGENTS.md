@@ -81,7 +81,9 @@ tests/                standalone conftest stubs helpers.{extension,plugins,api}
 - **Writes return bools; terminal writes win.** `update_task`/`step_done`/
   `step_failed` return False on failure — engines treat a False as 'don't
   trust it'. `non_terminal_only` makes a status write a CAS so a landed
-  signal/terminal state can't be clobbered by a stale runner write.
+  signal/terminal state can't be clobbered by a stale runner write — a
+  losing CAS returns False (rowcount-checked), and `signal()` uses it to
+  close the read-then-write race against a concurrent terminal.
   Serialization happens BEFORE the transaction, so a poisoned result
   fails the step instead of rolling back a committed terminal status.
 - **A result that can't JSON is a failed step.** `_step` validates
@@ -118,6 +120,9 @@ tests/                standalone conftest stubs helpers.{extension,plugins,api}
   `iter_cap`, `loop_inputs`, `tool_calls_of`, `tool_message` — engines
   MUST consume these instead of re-shaping inline (that's how the two
   engines stay behavior-identical).
+- Restate ingress client → `_post` goes through `_SameOriginRedirect`:
+  a 307/308 would re-POST the task body to whatever Location says, so
+  only same-origin hops are followed; cross-origin raises HTTPError.
 - Restate signals → shared handlers resolve durable promises ONLY —
   `ctx.set` from a shared handler is illegal in the SDK. Pause names are
   `pause_{cycle}`/`resume_{cycle}` versioned by the run handler's

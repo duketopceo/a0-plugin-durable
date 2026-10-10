@@ -146,3 +146,32 @@ def test_status_empty_body_maps_to_unknown(monkeypatch):
         assert await eng.meta("t") is None
 
     run(_main())
+
+
+def test_redirect_handler_refuses_cross_origin():
+    """A cross-origin redirect would re-POST the task body (and any future
+    auth header) to the Location host — it must fail, not follow."""
+    import urllib.error
+    import urllib.request
+
+    handler = re_mod._SameOriginRedirect()
+    # GET: stdlib would follow it — our same-origin gate is what decides
+    req = urllib.request.Request("http://127.0.0.1:8111/AgentTask/t/get_state")
+
+    same = handler.redirect_request(
+        req, None, 302, "Found", {},
+        "http://127.0.0.1:8111/AgentTask/t/get_state/",
+    )
+    assert same is not None  # same-origin path rewrite follows
+
+    for bad in (
+        "https://127.0.0.1:8111/x",        # scheme change
+        "http://127.0.0.1:9999/x",         # port change
+        "http://169.254.169.254/latest",   # metadata endpoint
+        "http://evil.example/x",           # foreign host
+    ):
+        try:
+            handler.redirect_request(req, None, 302, "r", {}, bad)
+            raise AssertionError(f"redirect to {bad} was not refused")
+        except urllib.error.HTTPError as e:
+            assert "refused" in str(e)

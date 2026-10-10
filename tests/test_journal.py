@@ -98,10 +98,11 @@ def test_update_task_returns_bool_and_non_terminal_guard(journal_path):
     j.create_task("t", {})
     assert j.update_task("t", status=TaskStatus.EXECUTING) is True
     assert j.update_task("t", status=TaskStatus.FAILED) is True
-    # terminal guard: a stale runner write can't resurrect a finished task
+    # terminal guard: a stale runner write can't resurrect a finished task —
+    # and the CAS must report the loss so callers don't act on a phantom win
     assert j.update_task(
         "t", status=TaskStatus.EXECUTING, non_terminal_only=True
-    ) is True  # write lands but guard blocks the status flip
+    ) is False
     assert j.get_status("t") == "failed"
 
 
