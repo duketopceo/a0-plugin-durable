@@ -81,7 +81,9 @@ tests/                standalone conftest stubs helpers.{extension,plugins,api}
 - **Writes return bools; terminal writes win.** `update_task`/`step_done`/
   `step_failed` return False on failure — engines treat a False as 'don't
   trust it'. `non_terminal_only` makes a status write a CAS so a landed
-  signal/terminal state can't be clobbered by a stale runner write.
+  signal/terminal state can't be clobbered by a stale runner write — a
+  losing CAS returns False (rowcount-checked), and `signal()` uses it to
+  close the read-then-write race against a concurrent terminal.
   Serialization happens BEFORE the transaction, so a poisoned result
   fails the step instead of rolling back a committed terminal status.
 - **A result that can't JSON is a failed step.** `_step` validates
