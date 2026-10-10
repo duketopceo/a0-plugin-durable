@@ -118,6 +118,9 @@ tests/                standalone conftest stubs helpers.{extension,plugins,api}
   `iter_cap`, `loop_inputs`, `tool_calls_of`, `tool_message` — engines
   MUST consume these instead of re-shaping inline (that's how the two
   engines stay behavior-identical).
+- Restate ingress client → `_post` goes through `_SameOriginRedirect`:
+  a 307/308 would re-POST the task body to whatever Location says, so
+  only same-origin hops are followed; cross-origin raises HTTPError.
 - Restate signals → shared handlers resolve durable promises ONLY —
   `ctx.set` from a shared handler is illegal in the SDK. Pause names are
   `pause_{cycle}`/`resume_{cycle}` versioned by the run handler's

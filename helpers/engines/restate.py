@@ -38,7 +38,7 @@ import threading
 import urllib.error
 import urllib.request
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from usr.plugins.durable.helpers import LOG_NAME, registry
 from usr.plugins.durable.helpers.contract import (
@@ -281,6 +281,29 @@ async def _exec_step(*, name: str, kwargs: dict) -> dict:
 # --- ingress client (stdlib — no SDK needed to submit/query) -----------------
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """A 307/308 re-POSTs the full body — and any future auth header — to
+    whatever Location says. Only same-origin hops are followed (loopback
+    path rewrites are fine); cross-origin hops must fail the request
+    rather than leak the task payload."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urlparse(newurl)
+        old = urlparse(req.full_url)
+        if (new.scheme, new.netloc) != (old.scheme, old.netloc):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                f"restate redirect refused (cross-origin): {newurl}",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SameOriginRedirect())
+
+
 def _post(url: str, payload: dict | None, timeout: float = 10.0) -> dict | None:
     """POST JSON to a Restate endpoint; return parsed body or None.
     A parse failure is treated as unreachable — an empty/garbage body must
@@ -292,7 +315,7 @@ def _post(url: str, payload: dict | None, timeout: float = 10.0) -> dict | None:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             body = resp.read(65536)
             if not body:
                 return {}

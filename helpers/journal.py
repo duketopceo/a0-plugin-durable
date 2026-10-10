@@ -189,10 +189,14 @@ class Journal:
                         if non_terminal_only
                         else ""
                     )
-                    self._con.execute(
+                    cur = self._con.execute(
                         f"UPDATE tasks SET status=?, updated_at=? WHERE id=?{guard}",
                         (status.value, time.time(), task_id),
                     )
+                    if non_terminal_only and cur.rowcount == 0:
+                        # CAS lost — a terminal status landed (or the task is
+                        # gone); the caller must not act as if its write won
+                        return False
                 if state_json is not None:
                     self._con.execute(
                         "UPDATE tasks SET state_json=?, updated_at=? WHERE id=?",
