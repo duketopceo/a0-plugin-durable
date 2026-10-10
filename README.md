@@ -1,14 +1,59 @@
-# a0-plugin-durable
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/wordmark-dark.svg">
+    <img alt="a0-plugin-durable" src="assets/brand/wordmark.svg" height="64">
+  </picture>
+</p>
 
-Durable, restart-survivable agent tasks for [Agent Zero](https://github.com/agent0ai/agent-zero) — extracted from the Khan fork's Temporal-shaped `helpers/durable/`.
+Journaled, restart-survivable agent tasks for [Agent Zero](https://github.com/agent0ai/agent-zero): every step is recorded before its result is trusted, and a restarted task resumes at the first unfinished step.
 
-A "durable task" is an agent-loop-shaped unit of work — `llm_call` → `tool_call` × N → repeat — where **every step is journaled before its result is trusted**. If a0 restarts mid-task, journaled steps replay from their recorded results and execution resumes at the first unfinished step. Nothing re-runs that already ran.
+Status: version 0.1.0, pre-1.0, disabled by default. `llm_call` and `tool_call` are not wired by default; the host must register them. Roadmap: [ROADMAP.md](ROADMAP.md).
 
-Everything is opt-in: with `enabled: false` the plugin is fully inert and adds zero startup cost.
+<!-- TODO: screenshot of the settings panel from a running a0 (the plugin has no standalone UI) -->
+
+Extracted from the Khan fork's Temporal-shaped `helpers/durable/`. A "durable task" is an agent-loop-shaped unit of work (`llm_call`, then `tool_call` x N, repeat) where **every step is journaled before its result is trusted**. If a0 restarts mid-task, journaled steps replay from their recorded results and nothing that already ran re-runs. Everything is opt-in: with `enabled: false` the plugin is fully inert and adds zero startup cost.
 
 ## Install
 
-Drop into `usr/plugins/durable/` in an a0 checkout (see sibling plugins `a0-plugin-omaseal` / `a0-plugin-glitchtip` for the same layout). Enable it in the plugin settings or via env — `DURABLE_ENABLED`, `DURABLE_ENGINE`, `DURABLE_JOURNAL_PATH`, `DURABLE_RESTATE_INGRESS`, `DURABLE_RESTATE_ADMIN`, `DURABLE_LISTEN_PORT`, `DURABLE_MAX_CONCURRENT` map onto the keys in `default_config.yaml`.
+Drop into `usr/plugins/durable/` in an a0 checkout (see sibling plugins `a0-plugin-omaseal` / `a0-plugin-glitchtip` for the same layout). Enable it in the plugin settings or via env: `DURABLE_ENABLED`, `DURABLE_ENGINE`, `DURABLE_JOURNAL_PATH`, `DURABLE_RESTATE_INGRESS`, `DURABLE_RESTATE_ADMIN`, `DURABLE_LISTEN_PORT`, `DURABLE_MAX_CONCURRENT` map onto the keys below.
+
+## Quick start
+
+1. Set `enabled: true` (engine `local` needs nothing else).
+2. Register the steps in your host code: `register_step("llm_call", ...)` and `register_step("tool_call", ...)` (see "Task shape").
+3. POST `{"input": {"prompt_messages": [{"role": "user", "content": "..."}]}}` to `durable_submit`, then poll `durable_status` with the returned `task_id`.
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[durable_submit / tasks: in config] --> B[runtime]
+  B --> C{engine}
+  C -->|local| D[SQLite journal + in-process runner]
+  C -->|restate| E[Restate server + in-process endpoint]
+  D --> F[registry: llm_call / tool_call / api_call]
+  E --> F
+  J[job_loop tick] -->|resume incomplete tasks| D
+```
+
+Steps run through a name-keyed registry, so nothing non-serializable crosses an engine boundary. The `job_loop` extension re-attaches incomplete local tasks each tick.
+
+## Configuration
+
+Keys from `default_config.yaml`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch (`DURABLE_ENABLED`) |
+| `engine` | `local` | `local` or `restate` (`DURABLE_ENGINE`) |
+| `max_iterations` | `100` | Agent-loop cap per task; per-task override clamps to 10x |
+| `tasks` | `[]` | Declarative tasks submitted once per id by the tick |
+| `journal_path` | empty | SQLite file; empty = `<plugin>/data/durable.sqlite3` (`DURABLE_JOURNAL_PATH`) |
+| `step_timeout_s` | `300` | Per-step timeout, local engine |
+| `max_concurrent` | `8` | Live local runners (`DURABLE_MAX_CONCURRENT`) |
+| `restate_ingress` | `http://127.0.0.1:8080` | Restate ingress (`DURABLE_RESTATE_INGRESS`) |
+| `restate_admin` | `http://127.0.0.1:9070` | Restate admin API (`DURABLE_RESTATE_ADMIN`) |
+| `listen_port` | `9080` | In-process endpoint port, loopback only (`DURABLE_LISTEN_PORT`) |
 
 ## Engines
 
@@ -106,7 +151,7 @@ tasks:
 
 Malformed/disabled entries are skipped without stalling the job loop. See `default_config.yaml` for the full settings list.
 
-## Limits
+## Security and limits
 
 - `max_iterations` (default 100) caps the agent loop per task; per-task overrides clamp to `default * 10`.
 - `step_timeout_s` (default 300) bounds each journaled step on the local engine (Restate owns step timeouts/retry policy server-side).
@@ -120,6 +165,15 @@ Malformed/disabled entries are skipped without stalling the job loop. See `defau
 - `llm_call`/`tool_call` have no default wiring — the host registers them (see "Task shape"). Submitted tasks without an `llm_call` registration fail cleanly.
 - Journal lives under `data/` — gitignored. Back it up or delete it with the plugin.
 
+
+## Status and roadmap
+
+See [ROADMAP.md](ROADMAP.md) and the research in [docs/research/2026-10-10-landscape.md](docs/research/2026-10-10-landscape.md). Design direction: [DESIGN.md](DESIGN.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Read `AGENTS.md` first (journal schema, replay contract, registry). Config keys move together: `DEFAULTS`, `default_config.yaml`, `_ENV_MAP`, this README.
+
 ## Development
 
 ```bash
@@ -127,3 +181,7 @@ python3.12 -m pytest tests/ -q   # standalone, offline
 ```
 
 `AGENTS.md` documents the internals an agent needs (journal schema, replay contract, registry).
+
+## Licence
+
+See [LICENSE](LICENSE) and [NOTICE](NOTICE).
