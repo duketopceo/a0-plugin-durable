@@ -43,7 +43,7 @@ The memorable move: **every plugin is a 32-unit glyph seated in the same 64-unit
 
 ## 2. Research, reference lock and decision ledger
 
-Refero MCP was not connected on this machine (see `design-research.md` Track 1). Research ran on the local `awesome-design-md` analyses plus the bundled refero craft references, which is the fallback the skill allows.
+Refero MCP was not connected on this machine (the separate design-research notes were not committed to this repo). Research ran on the local `awesome-design-md` analyses plus the bundled refero craft references, which is the fallback the skill allows.
 
 References studied (all in `awesome-design-md/design-md/<name>/DESIGN.md`):
 
